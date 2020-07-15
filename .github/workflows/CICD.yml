@@ -1,0 +1,245 @@
+# This workflow builds the app, provisions and deploys the application into azure
+name: POWERful Devs CICD
+
+# setup 2 triggers. 1) push to master branch 2) manual trigger
+on: 
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'     
+        required: true
+        default: 'warning'
+      tags:
+        description: 'Tags goes here'  
+
+env:
+  SERVICE_PRINCIPAL: http://AbelDeployDemoBackupPrincipal
+  SERVICE_PRINCIPAL_TENANT: 72f988bf-86f1-41af-91ab-2d7cd011db47
+  RESOURCE_GROUP: covid-screening-app-rg
+  APIM_NAME: abel-screening-apis
+  COSMOS_DB_NAME: abel-screeningcosmosdb
+  APP_SERVICE_PLAN_NAME: abel-covidscreeningappapi-west-plan
+  APP_SERVICE_NAME: abel-covidscreeningappapi-west
+  ACR_NAME: abelcovidscreeningregistry
+  REGION: westus
+  PUBLISHER_NAME: abelsquidhead
+  PUBLISHER_EMAIL: abelemailgoeshere@microsoft.com
+  API_ID: abelCOVIDScreeningApi
+  SERVICE_URL: https://abel-covidscreeningappapi-west.azurewebsites.net
+  API_VERSION: v1
+  SWAGGER_FILE_PATH: "./src/COVIDScreeningApi/bin/Debug/netcoreapp3.1/swagger.json"
+
+jobs:
+  # This job builds the binaries runs tests and packages everything up so it's ready for deployment
+  buildFrontEnd:
+    runs-on: ubuntu-latest
+    steps:
+    
+    # checkout code from repo
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # setup runner for building .net core
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 3.1.101
+
+    # install dependencies with dotnet restore
+    - name: Install dependencies
+      run: dotnet restore
+
+    # build with dot net build
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+
+    # run tests with dot net test
+    - name: Test
+      run: dotnet test --no-restore --verbosity normal
+
+    # publish application to publishDirectory
+    - name: Publish to publish directory
+      run: dotnet publish --configuration Release --output publishDirectory
+    
+    # make staging directory for back end api
+    - name: Make staging directory for back end api
+      run: mkdir staging
+
+    # zip up publishDirectory and save to staging directory as website.zip
+    - name: Zip up publish folder
+      uses: montudor/action-zip@v0.1.0
+      with:
+        args: zip -qq -r ./staging/PPCOVIDScreeningApi.zip ./publishDirectory
+
+    # make staging directory for front end app
+    - name: Make staging directory for front end 
+      run: mkdir stagingFrontEnd
+
+    # copy front end to staging folder
+    - name: Copy front end binaries to staging
+      run: cp ./src/Deployment/COVIDResponseApp_managed.zip ./stagingFrontEnd
+
+    # upload as build artiffact
+    - name: Publish front end as artifact
+      uses: actions/upload-artifact@master
+      with:
+        name: frontEnd
+        path: stagingFrontEnd
+   
+    # upload build artifact
+    - name: Publish build artifacts back to GitHub
+      uses: actions/upload-artifact@master
+      with:
+        name: backendApi
+        path: staging
+
+  # this job builds and provisions back end App Service
+  buildProvisionBackEndAppService:
+    runs-on: ubuntu-latest
+    steps:
+    # checkout code from repo
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # make provisioning script executable
+    - name: Make provision script executable
+      run: chmod +x ./provisionWebApp.bash
+
+    # provision environment using bash script
+    - name: Execute provision web app script
+      run: >
+        ./provisionWebApp.bash \
+          -servicePrincipal $SERVICE_PRINCIPAL \
+          -servicePrincipalTenant $SERVICE_PRINCIPAL_TENANT \
+          -servicePrincipalSecret ${{ secrets.SERVICE_PRINCIPAL_SECRET }} \
+          -resourceGroupName $RESOURCE_GROUP \
+          -appServicePlanName $APP_SERVICE_PLAN_NAME \
+          -appServiceName $APP_SERVICE_NAME \
+          -acrName $ACR_NAME \
+          -region $REGION \
+
+  # this job runs in parallel to build and provisions all APIM Azure using azure cli in bash script
+  provisionAPIM: 
+    runs-on: ubuntu-latest
+    steps:
+    # checkout code from repo
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # make provisioning script executable
+    - name: Make provision script executable
+      run: chmod +x ./provisionAPIM.bash
+
+    # provision environment using bash script
+    - name: Execute provision infra script
+      run: >
+        ./provisionAPIM.bash \
+          -servicePrincipal $SERVICE_PRINCIPAL \
+          -servicePrincipalTenant $SERVICE_PRINCIPAL_TENANT \
+          -servicePrincipalSecret ${{ secrets.SERVICE_PRINCIPAL_SECRET }} \
+          -resourceGroupName $RESOURCE_GROUP \
+          -apimName $APIM_NAME \
+          -cosmosDbName $COSMOS_DB_NAME \
+          -appServicePlanName $APP_SERVICE_PLAN_NAME \
+          -appServiceName $APP_SERVICE_NAME \
+          -acrName $ACR_NAME \
+          -region $REGION \
+          -publisherName $PUBLISHER_NAME \
+          -publisherEmail $PUBLISHER_EMAIL
+
+  # this job runs in parallel to provision APIM and provisions cosmos DB into azure using azure cli in a bash script
+  provisionCosmos:
+    runs-on: ubuntu-latest
+    steps:
+    # checkout code from repo
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # make provisioning script executable
+    - name: Make provision script executable
+      run: chmod +x ./provisionCosmos.bash
+
+    # provision environment using bash script
+    - name: Execute provision infra script
+      run: >
+        ./provisionCosmos.bash \
+          -servicePrincipal $SERVICE_PRINCIPAL \
+          -servicePrincipalTenant $SERVICE_PRINCIPAL_TENANT \
+          -servicePrincipalSecret ${{ secrets.SERVICE_PRINCIPAL_SECRET }} \
+          -resourceGroupName $RESOURCE_GROUP \
+          -apimName $APIM_NAME \
+          -cosmosDbName $COSMOS_DB_NAME \
+          -appServicePlanName $APP_SERVICE_PLAN_NAME \
+          -appServiceName $APP_SERVICE_NAME \
+          -acrName $ACR_NAME \
+          -region $REGION \
+          -publisherName $PUBLISHER_NAME \
+          -publisherEmail $PUBLISHER_EMAIL
+
+  # this job waits for provisionAppService and provisionCosmos to finish and configures app services in Azure using azure cli in bash script
+  configureWebApp: 
+    needs: [buildProvisionBackEndAppService, provisionCosmos]
+    runs-on: ubuntu-latest
+    steps:
+    # checkout code from repo
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # make provisioning script executable
+    - name: Make configure script executable
+      run: chmod +x ./configureWebApp.bash
+
+    # provision environment using bash script
+    - name: Execute configure web app script
+      run: >
+        ./configureWebApp.bash \
+          -servicePrincipal $SERVICE_PRINCIPAL \
+          -servicePrincipalTenant $SERVICE_PRINCIPAL_TENANT \
+          -servicePrincipalSecret ${{ secrets.SERVICE_PRINCIPAL_SECRET }} \
+          -resourceGroupName $RESOURCE_GROUP \
+          -apimName $APIM_NAME \
+          -cosmosDbName $COSMOS_DB_NAME \
+          -appServicePlanName $APP_SERVICE_PLAN_NAME \
+          -appServiceName $APP_SERVICE_NAME \
+          -acrName $ACR_NAME \
+          -region $REGION \
+          -publisherName $PUBLISHER_NAME \
+          -publisherEmail $PUBLISHER_EMAIL
+
+  # this job waits for all the build, provision and configure steps to finish and then deploys the app into the resources provisioned in azure
+  deployBackEnd: 
+    needs: [buildFrontEnd, buildProvisionBackEndAppService, provisionAPIM, provisionCosmos, buildProvisionBackEndAppService, configureWebApp]
+    runs-on: self-hosted
+
+    steps:
+    # checkout code from repo
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # download build artifacts for front end
+    - name: Download build artifacts  for back end
+      uses: actions/download-artifact@master
+      with:
+        name: frontEnd  
+        
+    # download build artifacts for backendApi
+    - name: Download build artifacts for front end
+      uses: actions/download-artifact@master
+      with:
+        name: backendApi   
+
+    - name: Run import api script
+      run: >
+        powershell -command "& .\import-api-apim2.ps1 "
+        -spName $env:SERVICE_PRINCIPAL
+        -spTenant $env:SERVICE_PRINCIPAL_TENANT 
+        -spSecret ${{ secrets.SERVICE_PRINCIPAL_SECRET }} 
+        -ResourceGroupName $env:RESOURCE_GROUP 
+        -ApimInstance $env:APIM_NAME 
+        -ApiId $env:API_ID
+        -ServiceUrl $env:SERVICE_URL 
+        -ApiVersion $env:API_VERSION 
+        -SwaggerFilePath $env:SWAGGER_FILE_PATH

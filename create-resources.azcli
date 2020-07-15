@@ -1,0 +1,91 @@
+#!/bin/bash
+
+resourceGroup="covid-screening-app-resources-11"            # the name of the resource group
+apimName="screening-apis-11"                                # the name of the api management resource
+cosmosDbName="screeningcosmosdb-11"                         # the name of the cosmos db resource
+appServicePlanName="covidscreeningappapi-west-plan-11"      # the name of the app service plan for the app service
+appServiceName="covidscreeningappapi-west-11"               # the name of the app service that'll host the code
+acrName="covidscreeningregistry11"                          # the acr resource name  
+region="westus"                                             # the region in which we want things to be created
+publisherName="Ralphdalf"                                   # the owner name of the API management instance
+publisherEmail="notralphsrealemail@microsoft.com"           # the owner email of the API management instance
+
+# build the docker image for the app
+docker build --rm --pull -f "./src/COVIDScreeningApi/Dockerfile" -t "covidscreeningapi:latest" "."
+
+# create the resource group
+echo "Creating the resource group"
+az group create --name $resourceGroup --location $region
+echo "Created resource group"
+
+# create the acr resource
+az acr create --name "$acrName" --resource-group "$resourceGroup" --sku Standard --admin-enabled true
+
+# authenticate the environment to acr
+az acr login --name "$acrName"
+
+# tag the image for acr publish
+docker tag "covidscreeningapi:latest" "${acrName}.azurecr.io/covidscreeningapi:latest"
+
+# push the image to acr
+docker push "${acrName}.azurecr.io/covidscreeningapi:latest"
+
+# create the app service plan for the app
+echo "Creating app service plan"
+az appservice plan create --name $appServicePlanName --resource-group $resourceGroup --is-linux
+echo "Created app service plan"
+
+# create the app service
+echo "Creating app service"
+az webapp create --name "$appServiceName" --plan "$appServicePlanName" --resource-group "$resourceGroup" -i "${acrName}.azurecr.io/covidscreeningapi:latest"
+echo "Created app service"
+
+# get the host name for the site
+swaggerHostName="https://$(az webapp show -n $appServiceName -g $resourceGroup --query hostNames --output tsv)"
+
+# set the swagger base url config property
+echo "Updating swagger base url"
+az webapp config appsettings set \
+  --settings SwaggerBaseUrl="${swaggerHostName}" \
+  --name "$appServiceName" \
+  --resource-group "$resourceGroup"
+echo "Updated swagger base url"
+
+# create the apim resource
+echo "Creating APIM resource"
+az apim create --name $apimName --resource-group $resourceGroup --sku-name Consumption --publisher-email $publisherEmail --publisher-name $publisherName
+echo "Created APIM resource"
+
+# create the cosmos db resource
+echo "Creating Cosmos DB instance"
+az cosmosdb create --name $cosmosDbName --resource-group $resourceGroup
+echo "Created Cosmos DB instance"
+
+# create the cosmos db in the cosmos db resource
+echo "Creating Cosmos DB database"
+az cosmosdb database create --name $cosmosDbName --resource-group-name $resourceGroup --db-name "COVIDScreeningDb"
+echo "Created Cosmos DB database"
+
+# create the 3 collections in the cosmos db resource we'll need
+echo "Creating Cosmos DB collections"
+az cosmosdb collection create --name $cosmosDbName --resource-group-name $resourceGroup --db-name "COVIDScreeningDb" --collection-name "PortsOfEntry" --partition-key-path "/PartitionKey"
+az cosmosdb collection create --name $cosmosDbName --resource-group-name $resourceGroup --db-name "COVIDScreeningDb" --collection-name "Representatives" --partition-key-path "/PartitionKey"
+az cosmosdb collection create --name $cosmosDbName --resource-group-name $resourceGroup --db-name "COVIDScreeningDb" --collection-name "Screenings" --partition-key-path "/PartitionKey"
+echo "Created Cosmos DB collections"
+
+# get the connection string of the cosmos db resource
+echo "Getting Cosmos DB connection string"
+cosmosDbConnectionString=$(az cosmosdb keys list -n $cosmosDbName -g $resourceGroup --type connection-strings --query connectionStrings[0].connectionString --output tsv)
+echo "Got Cosmos DB connection string"
+
+# set the connection string in the app service
+echo "Updating app service connection string"
+az webapp config connection-string set \
+  --connection-string-type Custom \
+  --settings CosmosDbConnectionString="${cosmosDbConnectionString}" \
+  --name "$appServiceName" \
+  --resource-group "$resourceGroup"
+echo "Updated app service connection string"
+
+# human validation moment
+echo "Finished"
